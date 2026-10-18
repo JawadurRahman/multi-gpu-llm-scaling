@@ -1,0 +1,8 @@
+# PyTorch is NOT listed here on purpose: the right wheel depends on the machine.
+#   CPU (local smoke tests):  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   GPU (GCP VM, CUDA 12.x):  pip install torch --index-url https://download.pytorch.org/whl/cu124
+# scripts/setup_gcp.sh installs the CUDA build on the VM.
+numpy
+tiktoken      # GPT-2 BPE tokenizer used by data prep
+requests      # downloads the dataset
+matplotlib    # scripts/make_plots.py
