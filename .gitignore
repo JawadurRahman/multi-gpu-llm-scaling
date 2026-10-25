@@ -21,6 +21,9 @@ wandb/
 # Chrome/TensorBoard traces are often hundreds of MB per run, so they stay local.
 # The summary numbers taken from them go into results/*.csv, which IS tracked.
 results/traces/
+
+# --- CPU smoke-test output (not benchmark results) ---
+results/smoke/
 *.pt.trace.json
 *.pt.trace.json.gz
 
