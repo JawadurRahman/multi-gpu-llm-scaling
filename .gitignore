@@ -24,6 +24,9 @@ results/traces/
 
 # --- CPU smoke-test output (not benchmark results) ---
 results/smoke/
+
+# --- results tarball downloaded by `setup_gcp.sh fetch` ---
+results_from_vm.tgz
 *.pt.trace.json
 *.pt.trace.json.gz
 
