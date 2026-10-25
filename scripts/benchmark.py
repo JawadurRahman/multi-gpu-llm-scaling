@@ -89,6 +89,13 @@ def parse_args():
     p.add_argument("--lr", type=float, default=6e-4)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=1.0, help="0 disables clipping")
+    # data parallelism
+    p.add_argument("--parallel", choices=["ddp", "fsdp"], default="ddp",
+                   help="ddp: replicate the model on every GPU (default). "
+                        "fsdp: EXPERIMENTAL, shard params/grads/optimizer state (FSDP2 fully_shard)")
+    p.add_argument("--fsdp_reshard_after_forward", action=argparse.BooleanOptionalAction, default=True,
+                   help="fsdp only: free each block's gathered params after forward (ZeRO-3, less "
+                        "memory, one more all-gather in backward). --no-... keeps them (ZeRO-2-like)")
     # system
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
@@ -127,6 +134,9 @@ def parse_args():
             args.dtype = "fp32"
     if args.dtype == "bf16" and args.device == "cuda" and not torch.cuda.is_bf16_supported():
         p.error("this GPU has no bf16 support (e.g. T4); use --dtype fp16")
+    if args.parallel == "fsdp" and args.dtype == "fp16":
+        # GradScaler + FSDP2's sharded DTensor gradients is not validated in this repo
+        p.error("the experimental FSDP mode supports --dtype fp32 or bf16 only")
     if args.results_csv is None:
         # CPU runs are smoke tests only. They go to a git-ignored folder so they can never be
         # mixed into the GPU results that the plots and README are built from.
@@ -189,6 +199,26 @@ class BatchLoader:
     def next_batch(self):
         x, y = next(self.it)
         return x.to(self.device, non_blocking=self.non_blocking), y.to(self.device, non_blocking=self.non_blocking)
+
+
+def shard_fsdp(model, args, pt_dtype, world, device):
+    """EXPERIMENTAL. FSDP2 (fully_shard): ZeRO-3 style sharding of parameters, gradients and
+    optimizer state across ranks. Each transformer block is its own unit, so only one block's
+    full parameters are materialised at a time: all-gathered just before the block runs, freed
+    after (unless --no-fsdp_reshard_after_forward), and gradients are reduce-scattered."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    mesh = init_device_mesh(device.type, (world,))
+    # Parameters are all-gathered in the compute dtype (half the all-gather bytes of fp32).
+    # Gradients are reduced in fp32, the same as DDP under autocast, to keep numerics comparable.
+    mp = MixedPrecisionPolicy(param_dtype=None if args.dtype == "fp32" else pt_dtype,
+                              reduce_dtype=torch.float32)
+    for block in model.transformer.h:
+        fully_shard(block, mesh=mesh, mp_policy=mp, reshard_after_forward=args.fsdp_reshard_after_forward)
+    # Root unit holds the rest: embeddings, final LayerNorm and lm_head (tied to wte, so the two
+    # must live in the same unit). Not resharded after forward: backward needs it right away.
+    fully_shard(model, mesh=mesh, mp_policy=mp, reshard_after_forward=False)
 
 
 def sync(device):
@@ -265,20 +295,6 @@ def main():
         raise SystemExit(f"{data_path} not found. Run: python scripts/prepare_data.py --dataset {args.dataset}")
     loader = BatchLoader(args, data_path, rank, device)
 
-    # ---- model ----
-    config = GPTConfig(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
-                       block_size=args.block_size, vocab_size=args.vocab_size)
-    model = GPT(config).to(device)
-    n_params = model.get_num_params()
-    flops_per_token = model.flops_per_token()
-    optimizer = model.configure_optimizers(args.weight_decay, args.lr, (0.9, 0.95), device.type)
-    if args.compile:
-        # compile before wrapping in DDP (as nanoGPT does); DDP then splits the compiled graph at
-        # gradient-bucket boundaries so all-reduce can still overlap with backward
-        model = torch.compile(model, backend=args.compile_backend)
-    if world > 1:
-        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
-
     # ---- mixed precision ----
     # Weights and optimizer state stay fp32; autocast runs matmuls etc. in bf16/fp16.
     pt_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
@@ -287,10 +303,33 @@ def main():
     # up first. bf16 has fp32's exponent range and needs no scaler. Disabled = transparent no-op.
     scaler = torch.amp.GradScaler(device.type, enabled=args.dtype == "fp16")
 
+    # ---- model ----
+    config = GPTConfig(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
+                       block_size=args.block_size, vocab_size=args.vocab_size)
+    model = raw_model = GPT(config).to(device)
+    n_params = raw_model.get_num_params()
+    flops_per_token = raw_model.flops_per_token()
+    if args.parallel == "fsdp":
+        shard_fsdp(raw_model, args, pt_dtype, world, device)  # shards in place
+        if args.compile:
+            model = torch.compile(model, backend=args.compile_backend)  # FSDP2: compile after sharding
+    else:
+        if args.compile:
+            # compile before wrapping in DDP (as nanoGPT does); DDP then splits the compiled graph at
+            # gradient-bucket boundaries so all-reduce can still overlap with backward
+            model = torch.compile(model, backend=args.compile_backend)
+        if world > 1:
+            model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+    # Created after sharding: FSDP replaces each parameter with a sharded DTensor, and the
+    # optimizer must hold those (so each rank only keeps optimizer state for its own shard).
+    optimizer = raw_model.configure_optimizers(args.weight_decay, args.lr, (0.9, 0.95), device.type)
+
     tokens_per_step = world * args.batch_size * args.grad_accum * args.block_size
     if master:
-        print(f"world_size={world} device={device} dtype={args.dtype} compile={args.compile} "
-              f"params={n_params / 1e6:.2f}M n_head={args.n_head} vocab={args.vocab_size} "
+        if args.parallel == "fsdp":
+            print("*** EXPERIMENTAL: FSDP mode. See docs/fsdp.md for what is and isn't validated. ***")
+        print(f"world_size={world} parallel={args.parallel} device={device} dtype={args.dtype} "
+              f"compile={args.compile} params={n_params / 1e6:.2f}M n_head={args.n_head} vocab={args.vocab_size} "
               f"tokens/step={tokens_per_step:,} warmup={args.warmup_steps} steps={args.steps}")
 
     run_id = shared_run_id(args, world)
@@ -302,8 +341,13 @@ def main():
         for micro in range(args.grad_accum):
             # DDP all-reduces gradients on every backward by default. With accumulation only the
             # last micro-batch needs it; no_sync() skips the others (gradients just accumulate locally).
+            # FSDP's equivalent is set_requires_gradient_sync(False) (skip the reduce-scatter).
             last = micro == args.grad_accum - 1
-            sync_ctx = model.no_sync() if (world > 1 and not last) else nullcontext()
+            sync_ctx = nullcontext()
+            if args.parallel == "fsdp":
+                raw_model.set_requires_gradient_sync(last)
+            elif world > 1 and not last:
+                sync_ctx = model.no_sync()
             with phase("data_loading"):
                 x, y = loader.next_batch()
             with sync_ctx:
@@ -393,8 +437,10 @@ def main():
 
     # ---- correctness check: DDP replicas must still hold identical weights ----
     # If gradients were not all-reduced, ranks would diverge after the first step on different data.
-    replicas_match = True
-    if world > 1:
+    # Not applicable to FSDP: each rank holds a different shard by design. FSDP correctness is
+    # checked instead by comparing its loss curve against DDP's on the same seed (docs/fsdp.md).
+    replicas_match = True if args.parallel == "ddp" else ""
+    if world > 1 and args.parallel == "ddp":
         with torch.no_grad():
             checksum = sum(p.double().sum() for p in model.parameters()).item()
         replicas_match = reduce_max(checksum, device) == -reduce_max(-checksum, device)
@@ -424,6 +470,7 @@ def main():
             "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else platform.processor(),
             "num_gpus": world if device.type == "cuda" else 0,
             "world_size": world,
+            "parallel": args.parallel,
             "model": args.model,
             "params_m": round(n_params / 1e6, 3),
             "n_layer": args.n_layer, "n_head": args.n_head, "n_embd": args.n_embd,
