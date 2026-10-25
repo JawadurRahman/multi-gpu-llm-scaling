@@ -30,11 +30,13 @@ import platform
 import statistics
 import subprocess
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from model import GPT, GPTConfig
 from profiling import PROFILER_WARMUP_STEPS, format_summary, make_profiler, phase, summarize, top_ops_table
@@ -58,10 +60,28 @@ def parse_args():
     p.add_argument("--n_embd", type=int, help="override the preset")
     p.add_argument("--block_size", type=int, help="override the preset (sequence length)")
     p.add_argument("--vocab_size", type=int, default=50304,
-                   help="50304 = GPT-2's 50257 padded to a multiple of 64 (nanoGPT default)")
+                   help="50304 = GPT-2's 50257 padded to a multiple of 64 (nanoGPT default); "
+                        "50257 = unpadded. Padding makes the lm_head / embedding matmuls tile evenly.")
+    p.add_argument("--head_dim", type=int,
+                   help="attention head dimension; sets n_head = n_embd // head_dim (GPT-2 small: 64). "
+                        "Params are unchanged, only how attention is split into heads.")
     # data / batch
     p.add_argument("--dataset", default="openwebtext", help="reads data/<dataset>/train.bin")
     p.add_argument("--batch_size", type=int, default=8, help="micro-batch size PER GPU (sequences)")
+    p.add_argument("--grad_accum", type=int, default=1,
+                   help="micro-batches per optimizer step (per GPU). DDP all-reduces only on the last one.")
+    p.add_argument("--num_workers", type=int, default=0,
+                   help="DataLoader worker processes; 0 = load batches in the training process")
+    p.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=False,
+                   help="page-locked host batches, enabling async (non_blocking) host-to-GPU copies")
+    # precision / compiler
+    p.add_argument("--dtype", choices=["auto", "fp32", "bf16", "fp16"], default="auto",
+                   help="autocast dtype. auto: bf16 on GPUs that support it (L4, A100), fp16 otherwise "
+                        "(T4), fp32 on CPU. fp16 uses a GradScaler to avoid gradient underflow.")
+    p.add_argument("--compile", action="store_true", help="torch.compile the model (compile time is in warmup)")
+    p.add_argument("--compile_backend", default="inductor",
+                   help="torch.compile backend. 'inductor' for real runs; 'aot_eager' traces the graph "
+                        "without codegen, to test the compile path on machines without a C++ compiler")
     # run length
     p.add_argument("--warmup_steps", type=int, default=20, help="untimed steps (allocator, cuDNN/NCCL setup)")
     p.add_argument("--steps", type=int, default=200, help="timed steps")
@@ -86,12 +106,27 @@ def parse_args():
     p.add_argument("--log_interval", type=int, default=20)
     args = p.parse_args()
 
+    if args.warmup_steps < 1 or args.steps < 1 or args.grad_accum < 1:
+        p.error("--warmup_steps, --steps and --grad_accum must be >= 1")
+    if args.head_dim is not None and args.n_head is not None:
+        p.error("pass --head_dim or --n_head, not both")
     # fill unset architecture fields from the preset
     for k, v in MODEL_PRESETS[args.model].items():
         if getattr(args, k) is None:
             setattr(args, k, v)
+    if args.head_dim is not None:
+        if args.n_embd % args.head_dim:
+            p.error(f"--head_dim {args.head_dim} must divide n_embd={args.n_embd}")
+        args.n_head = args.n_embd // args.head_dim
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.dtype == "auto":
+        if args.device == "cuda":
+            args.dtype = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        else:
+            args.dtype = "fp32"
+    if args.dtype == "bf16" and args.device == "cuda" and not torch.cuda.is_bf16_supported():
+        p.error("this GPU has no bf16 support (e.g. T4); use --dtype fp16")
     if args.results_csv is None:
         # CPU runs are smoke tests only. They go to a git-ignored folder so they can never be
         # mixed into the GPU results that the plots and README are built from.
@@ -116,24 +151,44 @@ def setup_distributed(device_type):
     return rank, local_rank, world, device
 
 
-class RandomWindowSampler:
-    """nanoGPT's "poor man's data loader": sample random block_size windows from a
-    memory-mapped token file. Each rank uses its own seed so ranks see different data."""
+class RandomWindows(IterableDataset):
+    """Endless stream of random (x, y) windows from a memory-mapped token file: nanoGPT's
+    sampling scheme, wrapped as a Dataset so DataLoader workers / pin_memory can be toggled.
+    Every (rank, worker) pair gets its own random stream, so no two see the same sequence."""
 
-    def __init__(self, path, batch_size, block_size, seed, device):
-        self.data = np.memmap(path, dtype=np.uint16, mode="r")
-        assert len(self.data) > block_size + 1, f"{path} is too small for block_size={block_size}"
-        self.batch_size, self.block_size, self.device = batch_size, block_size, device
-        self.gen = torch.Generator().manual_seed(seed)
+    def __init__(self, path, block_size, seed, rank):
+        self.path, self.block_size, self.seed, self.rank = path, block_size, seed, rank
+        n_tokens = os.path.getsize(path) // 2
+        assert n_tokens > block_size + 1, f"{path} is too small for block_size={block_size}"
+
+    def __iter__(self):
+        info = get_worker_info()
+        worker_id = info.id if info is not None else 0
+        # Open the memmap here, inside the process that reads it: worker processes are spawned
+        # and a memmap should not be pickled across to them.
+        data = np.memmap(self.path, dtype=np.uint16, mode="r")
+        rng = np.random.default_rng([self.seed, self.rank, worker_id])
+        high = len(data) - self.block_size - 1
+        while True:
+            i = int(rng.integers(high))
+            chunk = torch.from_numpy(data[i:i + self.block_size + 1].astype(np.int64))
+            yield chunk[:-1], chunk[1:]
+
+
+class BatchLoader:
+    def __init__(self, args, path, rank, device):
+        self.device = device
+        # non_blocking only makes the host-to-device copy async when the source is pinned
+        self.non_blocking = args.pin_memory and device.type == "cuda"
+        loader = DataLoader(RandomWindows(path, args.block_size, args.seed, rank),
+                            batch_size=args.batch_size, num_workers=args.num_workers,
+                            pin_memory=args.pin_memory and device.type == "cuda",
+                            persistent_workers=args.num_workers > 0)
+        self.it = iter(loader)
 
     def next_batch(self):
-        ix = torch.randint(len(self.data) - self.block_size - 1, (self.batch_size,), generator=self.gen)
-        x = torch.stack([torch.from_numpy(self.data[i:i + self.block_size].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(self.data[i + 1:i + 1 + self.block_size].astype(np.int64)) for i in ix])
-        if self.device.type == "cuda":
-            # pinned host memory allows a non_blocking (async) host-to-device copy
-            return x.pin_memory().to(self.device, non_blocking=True), y.pin_memory().to(self.device, non_blocking=True)
-        return x.to(self.device), y.to(self.device)
+        x, y = next(self.it)
+        return x.to(self.device, non_blocking=self.non_blocking), y.to(self.device, non_blocking=self.non_blocking)
 
 
 def sync(device):
@@ -208,7 +263,7 @@ def main():
     data_path = os.path.join(REPO_ROOT, "data", args.dataset, "train.bin")
     if not os.path.exists(data_path):
         raise SystemExit(f"{data_path} not found. Run: python scripts/prepare_data.py --dataset {args.dataset}")
-    loader = RandomWindowSampler(data_path, args.batch_size, args.block_size, args.seed + rank, device)
+    loader = BatchLoader(args, data_path, rank, device)
 
     # ---- model ----
     config = GPTConfig(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
@@ -217,41 +272,69 @@ def main():
     n_params = model.get_num_params()
     flops_per_token = model.flops_per_token()
     optimizer = model.configure_optimizers(args.weight_decay, args.lr, (0.9, 0.95), device.type)
+    if args.compile:
+        # compile before wrapping in DDP (as nanoGPT does); DDP then splits the compiled graph at
+        # gradient-bucket boundaries so all-reduce can still overlap with backward
+        model = torch.compile(model, backend=args.compile_backend)
     if world > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
-    tokens_per_step = world * args.batch_size * args.block_size
+    # ---- mixed precision ----
+    # Weights and optimizer state stay fp32; autocast runs matmuls etc. in bf16/fp16.
+    pt_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+    autocast = nullcontext() if args.dtype == "fp32" else torch.autocast(device.type, dtype=pt_dtype)
+    # fp16 has a narrow exponent range, so small gradients underflow to 0 unless the loss is scaled
+    # up first. bf16 has fp32's exponent range and needs no scaler. Disabled = transparent no-op.
+    scaler = torch.amp.GradScaler(device.type, enabled=args.dtype == "fp16")
+
+    tokens_per_step = world * args.batch_size * args.grad_accum * args.block_size
     if master:
-        print(f"world_size={world} device={device} params={n_params / 1e6:.2f}M "
+        print(f"world_size={world} device={device} dtype={args.dtype} compile={args.compile} "
+              f"params={n_params / 1e6:.2f}M n_head={args.n_head} vocab={args.vocab_size} "
               f"tokens/step={tokens_per_step:,} warmup={args.warmup_steps} steps={args.steps}")
 
     run_id = shared_run_id(args, world)
     results_dir = os.path.dirname(args.results_csv)
 
     def train_step():
-        # One optimizer step. The phase labels show up as named regions in profiler traces.
-        with phase("data_loading"):
-            x, y = loader.next_batch()
-        with phase("forward"):
-            _, loss = model(x, y)
-        with phase("backward"):
-            loss.backward()  # under DDP, gradient all-reduce runs here, overlapped with backward
+        # One optimizer step over grad_accum micro-batches. The phase labels show up as named
+        # regions in profiler traces.
+        for micro in range(args.grad_accum):
+            # DDP all-reduces gradients on every backward by default. With accumulation only the
+            # last micro-batch needs it; no_sync() skips the others (gradients just accumulate locally).
+            last = micro == args.grad_accum - 1
+            sync_ctx = model.no_sync() if (world > 1 and not last) else nullcontext()
+            with phase("data_loading"):
+                x, y = loader.next_batch()
+            with sync_ctx:
+                with phase("forward"), autocast:
+                    _, loss = model(x, y)
+                    loss = loss / args.grad_accum  # so accumulated grads equal the mean over micro-batches
+                with phase("backward"):
+                    scaler.scale(loss).backward()  # under DDP, all-reduce overlaps with this backward
         with phase("optimizer"):
             if args.grad_clip > 0:
+                scaler.unscale_(optimizer)  # clip the true gradients, not the scaled ones
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)  # with fp16, skips the step if any gradient is inf/nan
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        return loss
+        return loss.detach() * args.grad_accum  # last micro-batch's loss, unscaled for logging
 
     model.train()
 
     # ---- warmup (untimed) ----
+    # The first step includes torch.compile's compilation (if on) and CUDA/NCCL initialisation,
+    # so it is timed separately and reported as first_step_s.
+    sync(device)
+    t_first = time.perf_counter()
     for step in range(args.warmup_steps):
         loss = train_step()
         if step == 0:
             first_loss = loss.item()
+            first_step_s = reduce_max(time.perf_counter() - t_first, device)
             if master:
-                print(f"warmup step 0 loss {first_loss:.4f}")
+                print(f"warmup step 0 loss {first_loss:.4f} ({first_step_s:.1f} s incl. setup/compile)")
     sync(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)  # peak memory over the timed steps only
@@ -347,10 +430,16 @@ def main():
             "head_dim": args.n_embd // args.n_head,
             "block_size": args.block_size, "vocab_size": args.vocab_size,
             "dataset": args.dataset,
+            "dtype": args.dtype,
+            "compile": args.compile_backend if args.compile else False,
             "batch_size_per_gpu": args.batch_size,
+            "grad_accum": args.grad_accum,
+            "num_workers": args.num_workers,
+            "pin_memory": args.pin_memory,
             "global_batch_tokens": tokens_per_step,
             "warmup_steps": args.warmup_steps,
             "timed_steps": args.steps,
+            "first_step_s": round(first_step_s, 3),
             "step_time_ms_mean": round(statistics.mean(ms), 3),
             "step_time_ms_median": round(statistics.median(ms), 3),
             "step_time_ms_std": round(statistics.stdev(ms), 3) if len(ms) > 1 else 0.0,
