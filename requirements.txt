@@ -5,4 +5,5 @@
 numpy
 tiktoken      # GPT-2 BPE tokenizer used by data prep
 requests      # downloads the dataset
+pyarrow       # reads the OpenWebText parquet shards (not needed for Shakespeare)
 matplotlib    # scripts/make_plots.py
