@@ -18,6 +18,8 @@ Examples:
   torchrun --standalone --nproc_per_node=4 scripts/benchmark.py --dataset openwebtext --batch_size 8
   # tiny CPU smoke test
   python scripts/benchmark.py --model tiny --dataset shakespeare --warmup_steps 2 --steps 5
+  # add a profiler pass (traces -> results/traces/<run_id>/, summary -> results/profiles/<run_id>/)
+  torchrun --standalone --nproc_per_node=4 scripts/benchmark.py --dataset openwebtext --profile
 """
 
 import argparse
@@ -35,6 +37,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model import GPT, GPTConfig
+from profiling import PROFILER_WARMUP_STEPS, format_summary, make_profiler, phase, summarize, top_ops_table
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -71,6 +74,11 @@ def parse_args():
     p.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                    help="allow TF32 for fp32 matmuls on Ampere+ GPUs (nanoGPT default)")
     p.add_argument("--seed", type=int, default=1337)
+    # profiling
+    p.add_argument("--profile", action="store_true",
+                   help="after the timed steps, profile extra steps with torch.profiler: saves traces "
+                        "and prints a compute / communication / data-loading breakdown")
+    p.add_argument("--profile_steps", type=int, default=10, help="steps recorded by the profiler")
     # output
     p.add_argument("--run_name", default="", help="free-form label stored in the CSV")
     p.add_argument("--results_csv", default=None,
@@ -155,6 +163,22 @@ def reduce_max(value, device):
     return t.item()
 
 
+def shared_run_id(args, world):
+    """Rank 0's timestamped id, broadcast so every rank writes files under the same name."""
+    run_id = [f"{time.strftime('%Y%m%d-%H%M%S')}_{args.model}_g{world}_b{args.batch_size}"
+              + (f"_{args.run_name}" if args.run_name else "")]
+    if dist.is_initialized():
+        dist.broadcast_object_list(run_id, src=0)
+    return run_id[0]
+
+
+def _fmt(summary, key):
+    """Profiler value for the CSV, or empty when not profiled / not available on this device."""
+    if summary is None or key not in summary:
+        return ""
+    return round(summary[key], 4)
+
+
 def append_csv(path, row):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     exists = os.path.exists(path) and os.path.getsize(path) > 0
@@ -201,40 +225,88 @@ def main():
         print(f"world_size={world} device={device} params={n_params / 1e6:.2f}M "
               f"tokens/step={tokens_per_step:,} warmup={args.warmup_steps} steps={args.steps}")
 
-    # ---- train loop ----
-    step_times = []
-    first_loss = last_loss = None
-    total_steps = args.warmup_steps + args.steps
+    run_id = shared_run_id(args, world)
+    results_dir = os.path.dirname(args.results_csv)
+
+    def train_step():
+        # One optimizer step. The phase labels show up as named regions in profiler traces.
+        with phase("data_loading"):
+            x, y = loader.next_batch()
+        with phase("forward"):
+            _, loss = model(x, y)
+        with phase("backward"):
+            loss.backward()  # under DDP, gradient all-reduce runs here, overlapped with backward
+        with phase("optimizer"):
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        return loss
+
     model.train()
-    for step in range(total_steps):
-        if step == args.warmup_steps and device.type == "cuda":
-            # measure peak memory over the timed steps only (steady state)
-            torch.cuda.reset_peak_memory_stats(device)
-        sync(device)
-        t0 = time.perf_counter()
 
-        # Step time is end-to-end: data loading + forward + backward (incl. DDP all-reduce,
-        # which overlaps with backward) + optimizer.
-        x, y = loader.next_batch()
-        _, loss = model(x, y)
-        loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        sync(device)
-        dt = time.perf_counter() - t0
-        if step >= args.warmup_steps:
-            step_times.append(dt)
-
-        if step == 0 or step == total_steps - 1 or step % args.log_interval == 0:
-            lossf = loss.item()  # rank-local loss; .item() is a sync point, so only on log steps
-            first_loss = lossf if first_loss is None else first_loss
-            last_loss = lossf
+    # ---- warmup (untimed) ----
+    for step in range(args.warmup_steps):
+        loss = train_step()
+        if step == 0:
+            first_loss = loss.item()
             if master:
-                phase = "warmup" if step < args.warmup_steps else "timed"
-                print(f"step {step:4d} ({phase}) loss {lossf:.4f} time {dt * 1000:.1f} ms")
+                print(f"warmup step 0 loss {first_loss:.4f}")
+    sync(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)  # peak memory over the timed steps only
+
+    # ---- timed steps ----
+    # GPU: per-step times come from CUDA events recorded on the stream between steps. We do NOT
+    # call cuda.synchronize() every step: that would stop the CPU from preparing step i+1 while the
+    # GPU runs step i, which no real training loop does, and would inflate data-loading cost.
+    # Throughput uses host wall-clock over the whole window, synchronised only at both ends.
+    is_cuda = device.type == "cuda"
+    marks = [torch.cuda.Event(enable_timing=True) for _ in range(args.steps + 1)] if is_cuda else []
+    wall_t0 = time.perf_counter()
+    for i in range(args.steps):
+        if is_cuda:
+            marks[i].record()
+        else:
+            marks.append(time.perf_counter())
+        loss = train_step()
+        if (i + 1) % args.log_interval == 0:
+            lossf = loss.item()  # sync point, so only on log steps
+            if master:
+                avg_ms = (time.perf_counter() - wall_t0) * 1000 / (i + 1)
+                print(f"timed step {i + 1:4d}/{args.steps} loss {lossf:.4f} avg {avg_ms:.1f} ms/step")
+    if is_cuda:
+        marks[-1].record()
+    else:
+        marks.append(time.perf_counter())
+    sync(device)
+    wall_time = time.perf_counter() - wall_t0
+    last_loss = loss.item()
+    if is_cuda:
+        step_ms = [marks[i].elapsed_time(marks[i + 1]) for i in range(args.steps)]
+    else:
+        step_ms = [(marks[i + 1] - marks[i]) * 1000 for i in range(args.steps)]
+
+    # ---- optional profiling window (after the timed steps, so it can't skew them) ----
+    profile_summary = None
+    if args.profile:
+        trace_dir = os.path.join(results_dir, "traces", run_id)
+        n = PROFILER_WARMUP_STEPS + args.profile_steps
+        with make_profiler(device, trace_dir, rank, args.profile_steps) as prof:
+            for i in range(n):
+                train_step()
+                if i == n - 1:
+                    sync(device)  # make sure the last step's kernels finish inside the window
+                prof.step()
+        profile_summary = summarize(prof, device, args.profile_steps)
+        prof_dir = os.path.join(results_dir, "profiles", run_id)
+        os.makedirs(prof_dir, exist_ok=True)
+        with open(os.path.join(prof_dir, f"rank{rank}.json"), "w") as f:
+            json.dump({"run_id": run_id, "rank": rank, **profile_summary}, f, indent=2)
+        if master:
+            print("\n" + top_ops_table(prof, device))
+            print(format_summary(profile_summary, rank))
+            print(f"  traces: {trace_dir}  (all ranks' summaries: {prof_dir})")
 
     # ---- correctness check: DDP replicas must still hold identical weights ----
     # If gradients were not all-reduced, ranks would diverge after the first step on different data.
@@ -249,7 +321,7 @@ def main():
     # ---- aggregate across ranks ----
     # Ranks are synchronised every step by the gradient all-reduce, so their wall-clock totals
     # are close; taking the max is the conservative choice (the slowest rank sets the pace).
-    total_time = reduce_max(sum(step_times), device)
+    total_time = reduce_max(wall_time, device)
     peak_alloc_mb = peak_reserved_mb = None
     if device.type == "cuda":
         peak_alloc_mb = reduce_max(torch.cuda.max_memory_allocated(device) / 2**20, device)
@@ -257,10 +329,8 @@ def main():
 
     if master:
         tokens_per_sec = tokens_per_step * args.steps / total_time
-        ms = [t * 1000 for t in step_times]
+        ms = step_ms
         commit, dirty = git_info()
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        run_id = f"{timestamp}_{args.model}_g{world}_b{args.batch_size}" + (f"_{args.run_name}" if args.run_name else "")
 
         row = {
             "run_id": run_id,
@@ -296,6 +366,11 @@ def main():
             "loss_first": round(first_loss, 4),
             "loss_last": round(last_loss, 4),
             "replicas_match": replicas_match,
+            # profiler breakdown (rank 0) if --profile was set; all ranks are in results/profiles/
+            "prof_gpu_compute_frac": _fmt(profile_summary, "gpu_compute_frac"),
+            "prof_gpu_comm_exposed_frac": _fmt(profile_summary, "gpu_comm_exposed_frac"),
+            "prof_gpu_idle_frac": _fmt(profile_summary, "gpu_idle_frac"),
+            "prof_cpu_data_loading_ms": _fmt(profile_summary, "cpu_data_loading_ms"),
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda or "",
             "nccl_version": ".".join(map(str, torch.cuda.nccl.version())) if device.type == "cuda" else "",
@@ -315,7 +390,7 @@ def main():
         print(f"\n{run_id}")
         print(f"  tokens/s:   {tokens_per_sec:,.0f}  ({tokens_per_sec / world:,.0f} per rank)")
         print(f"  step time:  mean {row['step_time_ms_mean']} ms, median {row['step_time_ms_median']} ms, "
-              f"std {row['step_time_ms_std']} ms")
+              f"std {row['step_time_ms_std']} ms (timed steps, profiler off)")
         if peak_alloc_mb is not None:
             print(f"  peak mem:   {peak_alloc_mb:,.0f} MB allocated, {peak_reserved_mb:,.0f} MB reserved (max over ranks)")
         print(f"  wrote {args.results_csv} and {steps_path}")
